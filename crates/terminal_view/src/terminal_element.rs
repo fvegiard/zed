@@ -4,7 +4,7 @@ use gpui::{
     Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
     IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point, ShapedLine, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
+    Point, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
     UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
     size,
 };
@@ -25,7 +25,8 @@ use terminal::{
     },
     terminal_settings::TerminalSettings,
 };
-use theme::{ActiveTheme, Theme, ThemeSettings};
+use theme::{ActiveTheme, Theme};
+use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
 use ui::{ParentElement, Tooltip};
 use util::ResultExt;
@@ -43,6 +44,7 @@ pub struct LayoutState {
     rects: Vec<LayoutRect>,
     relative_highlighted_ranges: Vec<(RangeInclusive<AlacPoint>, Hsla)>,
     cursor: Option<CursorLayout>,
+    ime_cursor_bounds: Option<Bounds<Pixels>>,
     background_color: Hsla,
     dimensions: TerminalBounds,
     mode: TermMode,
@@ -55,6 +57,7 @@ pub struct LayoutState {
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
+#[derive(Copy, Clone)]
 struct DisplayCursor {
     line: i32,
     col: usize,
@@ -374,16 +377,13 @@ impl TerminalElement {
                     let col = cell.point.column.0 as i32;
 
                     // Try to extend the last region if it's on the same line with the same color
-                    if let Some(last_region) = background_regions.last_mut() {
-                        if last_region.color == color
-                            && last_region.start_line == alac_line
-                            && last_region.end_line == alac_line
-                            && last_region.end_col + 1 == col
-                        {
-                            last_region.end_col = col;
-                        } else {
-                            background_regions.push(BackgroundRegion::new(alac_line, col, color));
-                        }
+                    if let Some(last_region) = background_regions.last_mut()
+                        && last_region.color == color
+                        && last_region.start_line == alac_line
+                        && last_region.end_line == alac_line
+                        && last_region.end_col + 1 == col
+                    {
+                        last_region.end_col = col;
                     } else {
                         background_regions.push(BackgroundRegion::new(alac_line, col, color));
                     }
@@ -486,8 +486,11 @@ impl TerminalElement {
         }
 
         let layout_time = start_time.elapsed();
+
         log::debug!(
-            "Terminal layout_grid: {} cells processed, {} batched runs created, {} rects (from {} merged regions), layout took {:?}",
+            "Terminal layout_grid: {} cells processed, \
+            {} batched runs created, {} rects (from {} merged regions), \
+            layout took {:?}",
             cell_count,
             batched_runs.len(),
             rects.len(),
@@ -498,28 +501,13 @@ impl TerminalElement {
         (rects, batched_runs)
     }
 
-    /// Computes the cursor position and expected block width, may return a zero width if x_for_index returns
-    /// the same position for sequential indexes. Use em_width instead
-    fn shape_cursor(
-        cursor_point: DisplayCursor,
-        size: TerminalBounds,
-        text_fragment: &ShapedLine,
-    ) -> Option<(Point<Pixels>, Pixels)> {
+    /// Computes the cursor position based on the cursor point and terminal dimensions.
+    fn cursor_position(cursor_point: DisplayCursor, size: TerminalBounds) -> Option<Point<Pixels>> {
         if cursor_point.line() < size.total_lines() as i32 {
-            let cursor_width = if text_fragment.width == Pixels::ZERO {
-                size.cell_width()
-            } else {
-                text_fragment.width
-            };
-
-            // Cursor should always surround as much of the text as possible,
-            // hence when on pixel boundaries round the origin down and the width up
-            Some((
-                point(
-                    (cursor_point.col() as f32 * size.cell_width()).floor(),
-                    (cursor_point.line() as f32 * size.line_height()).floor(),
-                ),
-                cursor_width.ceil(),
+            // When on pixel boundaries round the origin down
+            Some(point(
+                (cursor_point.col() as f32 * size.cell_width()).floor(),
+                (cursor_point.line() as f32 * size.line_height()).floor(),
             ))
         } else {
             None
@@ -562,11 +550,13 @@ impl TerminalElement {
         minimum_contrast: f32,
     ) -> TextRun {
         let flags = indexed.cell.flags;
+        let is_true_color = matches!(fg, terminal::alacritty_terminal::vte::ansi::Color::Spec(_));
         let mut fg = convert_color(&fg, colors);
         let bg = convert_color(&bg, colors);
 
-        // Only apply contrast adjustment to non-decorative characters
-        if !Self::is_decorative_character(indexed.c) {
+        // Skip contrast adjustment for true-color (24-bit RGB) foregrounds — the
+        // application chose that exact color. Also skip for decorative characters.
+        if !is_true_color && !Self::is_decorative_character(indexed.c) {
             fg = ensure_minimum_contrast(fg, bg, minimum_contrast);
         }
 
@@ -843,11 +833,8 @@ impl Element for TerminalElement {
             } => {
                 let rem_size = window.rem_size();
                 let line_height = f32::from(window.text_style().font_size.to_pixels(rem_size))
-                    * TerminalSettings::get_global(cx)
-                        .line_height
-                        .value()
-                        .to_pixels(rem_size);
-                (displayed_lines * line_height).into()
+                    * TerminalSettings::get_global(cx).line_height.value();
+                px(displayed_lines as f32 * line_height).into()
             }
             ContentMode::Scrollable => {
                 if let TerminalMode::Embedded { .. } = &self.mode {
@@ -929,7 +916,9 @@ impl Element for TerminalElement {
                     }
                     TerminalMode::Standalone => terminal_settings
                         .font_size
-                        .map_or(buffer_font_size, |size| theme::adjusted_font_size(size, cx)),
+                        .map_or(buffer_font_size, |size| {
+                            theme_settings::adjusted_font_size(size, cx)
+                        }),
                 };
 
                 let theme = cx.theme().clone();
@@ -955,7 +944,7 @@ impl Element for TerminalElement {
                     font_fallbacks,
                     font_size: font_size.into(),
                     font_style: FontStyle::Normal,
-                    line_height: line_height.into(),
+                    line_height: px(line_height).into(),
                     background_color: Some(theme.colors().terminal_ansi_background),
                     white_space: WhiteSpace::Normal,
                     // These are going to be overridden per-cell
@@ -970,8 +959,7 @@ impl Element for TerminalElement {
                 let (dimensions, line_height_px) = {
                     let rem_size = window.rem_size();
                     let font_pixels = text_style.font_size.to_pixels(rem_size);
-                    // TODO: line_height should be an f32 not an AbsoluteLength.
-                    let line_height = f32::from(font_pixels) * line_height.to_pixels(rem_size);
+                    let line_height = f32::from(font_pixels) * line_height;
                     let font_id = cx.text_system().resolve_font(&text_style.font());
 
                     let cell_width = text_system
@@ -994,7 +982,7 @@ impl Element for TerminalElement {
                     origin.x += gutter;
 
                     (
-                        TerminalBounds::new(line_height, cell_width, Bounds { origin, size }),
+                        TerminalBounds::new(px(line_height), cell_width, Bounds { origin, size }),
                         line_height,
                     )
                 };
@@ -1105,25 +1093,23 @@ impl Element for TerminalElement {
                     // internal line number (which can be negative in Scrollable mode for
                     // scrollback history).
                     let rows_above_viewport =
-                        ((intersection.top() - bounds.top()).max(px(0.)) / line_height_px) as usize;
+                        f32::from((intersection.top() - bounds.top()).max(px(0.)) / line_height_px)
+                            as usize;
                     let visible_row_count =
-                        (intersection.size.height / line_height_px).ceil() as usize + 1;
-
-                    // Group cells by line and filter to only the visible screen rows.
-                    // skip() and take() work on enumerated line groups (screen position),
-                    // making this work regardless of the actual cell.point.line values.
-                    let visible_cells: Vec<_> = cells
-                        .iter()
-                        .chunk_by(|c| c.point.line)
-                        .into_iter()
-                        .skip(rows_above_viewport)
-                        .take(visible_row_count)
-                        .flat_map(|(_, line_cells)| line_cells)
-                        .cloned()
-                        .collect();
+                        f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
 
                     TerminalElement::layout_grid(
-                        visible_cells.into_iter(),
+                        // Group cells by line and filter to only the visible screen rows.
+                        // skip() and take() work on enumerated line groups (screen position),
+                        // making this work regardless of the actual cell.point.line values.
+                        cells
+                            .iter()
+                            .chunk_by(|c| c.point.line)
+                            .into_iter()
+                            .skip(rows_above_viewport)
+                            .take(visible_row_count)
+                            .flat_map(|(_, line_cells)| line_cells)
+                            .cloned(),
                         rows_above_viewport as i32,
                         &text_style,
                         last_hovered_word
@@ -1136,49 +1122,61 @@ impl Element for TerminalElement {
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
                 // if we don't end up showing it.
+                let cursor_point = DisplayCursor::from(cursor.point, display_offset);
+                let cursor_text = {
+                    let str_trxt = cursor_char.to_string();
+                    let len = str_trxt.len();
+                    window.text_system().shape_line(
+                        str_trxt.into(),
+                        text_style.font_size.to_pixels(window.rem_size()),
+                        &[TextRun {
+                            len,
+                            font: text_style.font(),
+                            color: theme.colors().terminal_ansi_background,
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                };
+
+                // For whitespace, use cell width to avoid cursor stretching.
+                // For other characters, use the larger of shaped width and cell width
+                // to properly cover wide characters like emojis.
+                let cursor_width = if cursor_char.is_whitespace() {
+                    dimensions.cell_width()
+                } else {
+                    cursor_text.width.max(dimensions.cell_width())
+                };
+
+                let ime_cursor_bounds = TerminalElement::cursor_position(cursor_point, dimensions)
+                    .map(|cursor_position| Bounds {
+                        origin: cursor_position,
+                        size: size(cursor_width.ceil(), dimensions.line_height),
+                    });
+
                 let cursor = if let AlacCursorShape::Hidden = cursor.shape {
                     None
                 } else {
-                    let cursor_point = DisplayCursor::from(cursor.point, display_offset);
-                    let cursor_text = {
-                        let str_trxt = cursor_char.to_string();
-                        let len = str_trxt.len();
-                        window.text_system().shape_line(
-                            str_trxt.into(),
-                            text_style.font_size.to_pixels(window.rem_size()),
-                            &[TextRun {
-                                len,
-                                font: text_style.font(),
-                                color: theme.colors().terminal_ansi_background,
-                                ..Default::default()
-                            }],
-                            None,
-                        )
-                    };
-
                     let focused = self.focused;
-                    TerminalElement::shape_cursor(cursor_point, dimensions, &cursor_text).map(
-                        move |(cursor_position, block_width)| {
-                            let (shape, text) = match cursor.shape {
-                                AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
-                                AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
-                                AlacCursorShape::Underline => (CursorShape::Underline, None),
-                                AlacCursorShape::Beam => (CursorShape::Bar, None),
-                                AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
-                                //This case is handled in the if wrapping the whole cursor layout
-                                AlacCursorShape::Hidden => unreachable!(),
-                            };
+                    ime_cursor_bounds.map(move |bounds| {
+                        let (shape, text) = match cursor.shape {
+                            AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
+                            AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
+                            AlacCursorShape::Underline => (CursorShape::Underline, None),
+                            AlacCursorShape::Beam => (CursorShape::Bar, None),
+                            AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
+                            AlacCursorShape::Hidden => unreachable!(),
+                        };
 
-                            CursorLayout::new(
-                                cursor_position,
-                                block_width,
-                                dimensions.line_height,
-                                theme.players().local().cursor,
-                                shape,
-                                text,
-                            )
-                        },
-                    )
+                        CursorLayout::new(
+                            bounds.origin,
+                            bounds.size.width,
+                            bounds.size.height,
+                            theme.players().local().cursor,
+                            shape,
+                            text,
+                        )
+                    })
                 };
 
                 let block_below_cursor_element = if let Some(block) = &self.block_below_cursor {
@@ -1217,6 +1215,7 @@ impl Element for TerminalElement {
                     hitbox,
                     batched_text_runs,
                     cursor,
+                    ime_cursor_bounds,
                     background_color,
                     dimensions,
                     rects,
@@ -1259,10 +1258,7 @@ impl Element for TerminalElement {
             let terminal_input_handler = TerminalInputHandler {
                 terminal: self.terminal.clone(),
                 terminal_view: self.terminal_view.clone(),
-                cursor_bounds: layout
-                    .cursor
-                    .as_ref()
-                    .map(|cursor| cursor.bounding_rect(origin)),
+                cursor_bounds: layout.ime_cursor_bounds.map(|bounds| bounds + origin),
                 workspace: self.workspace.clone(),
             };
 
@@ -1311,13 +1307,12 @@ impl Element for TerminalElement {
                         rect.paint(origin, &layout.dimensions, window);
                     }
 
-                    for (relative_highlighted_range, color) in
-&                        layout.relative_highlighted_ranges
-                    {
+                    for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
                             to_highlighted_range_lines(relative_highlighted_range, layout, origin)
                         {
-                            let corner_radius = if EditorSettings::get_global(cx).rounded_selection {
+                            let corner_radius = if EditorSettings::get_global(cx).rounded_selection
+                            {
                                 0.15 * layout.dimensions.line_height
                             } else {
                                 Pixels::ZERO
@@ -1342,42 +1337,54 @@ impl Element for TerminalElement {
 
                     if let Some(text_to_mark) = &marked_text_cloned
                         && !text_to_mark.is_empty()
-                            && let Some(cursor_layout) = &original_cursor {
-                                let ime_position = cursor_layout.bounding_rect(origin).origin;
-                                let mut ime_style = layout.base_text_style.clone();
-                                ime_style.underline = Some(UnderlineStyle {
-                                    color: Some(ime_style.color),
-                                    thickness: px(1.0),
-                                    wavy: false,
-                                });
+                        && let Some(ime_bounds) = layout.ime_cursor_bounds
+                    {
+                        let ime_position = (ime_bounds + origin).origin;
+                        let mut ime_style = layout.base_text_style.clone();
+                        ime_style.underline = Some(UnderlineStyle {
+                            color: Some(ime_style.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        });
 
-                                let shaped_line = window.text_system().shape_line(
-                                    text_to_mark.clone().into(),
-                                    ime_style.font_size.to_pixels(window.rem_size()),
-                                    &[TextRun {
-                                        len: text_to_mark.len(),
-                                        font: ime_style.font(),
-                                        color: ime_style.color,
-                                        underline: ime_style.underline,
-                                        ..Default::default()
-                                    }],
-                                    None
-                                );
-                                shaped_line.paint(
-                                    ime_position,
-                                    layout.dimensions.line_height,
-                                    gpui::TextAlign::Left,
-                                    None,
-                                    window,
-                                    cx,
-                                )
-                                    .log_err();
-                            }
+                        let shaped_line = window.text_system().shape_line(
+                            text_to_mark.clone().into(),
+                            ime_style.font_size.to_pixels(window.rem_size()),
+                            &[TextRun {
+                                len: text_to_mark.len(),
+                                font: ime_style.font(),
+                                color: ime_style.color,
+                                underline: ime_style.underline,
+                                ..Default::default()
+                            }],
+                            None,
+                        );
 
-                    if self.cursor_visible && marked_text_cloned.is_none()
-                        && let Some(mut cursor) = original_cursor {
-                            cursor.paint(origin, window, cx);
-                        }
+                        // Paint background to cover terminal text behind marked text
+                        let ime_background_bounds = Bounds::new(
+                            ime_position,
+                            size(shaped_line.width, layout.dimensions.line_height),
+                        );
+                        window.paint_quad(fill(ime_background_bounds, layout.background_color));
+
+                        shaped_line
+                            .paint(
+                                ime_position,
+                                layout.dimensions.line_height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .log_err();
+                    }
+
+                    if self.cursor_visible
+                        && marked_text_cloned.is_none()
+                        && let Some(mut cursor) = original_cursor
+                    {
+                        cursor.paint(origin, window, cx);
+                    }
 
                     if let Some(mut element) = block_below_cursor_element {
                         element.paint(window, cx);
@@ -1386,13 +1393,14 @@ impl Element for TerminalElement {
                     if let Some(mut element) = hyperlink_tooltip {
                         element.paint(window, cx);
                     }
-                    let total_paint_time = paint_start.elapsed();
+
                     log::debug!(
-                        "Terminal paint: {} text runs, {} rects, text paint took {:?}, total paint took {:?}",
+                        "Terminal paint: {} text runs, {} rects, \
+                        text paint took {:?}, total paint took {total_paint_time:?}",
                         layout.batched_text_runs.len(),
                         layout.rects.len(),
                         text_paint_time,
-                        total_paint_time
+                        total_paint_time = paint_start.elapsed()
                     );
                 },
             );
@@ -1482,12 +1490,12 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         _range_utf16: Option<std::ops::Range<usize>>,
         new_text: &str,
-        new_marked_range: Option<std::ops::Range<usize>>,
+        _new_marked_range: Option<std::ops::Range<usize>>,
         _window: &mut Window,
         cx: &mut App,
     ) {
         self.terminal_view.update(cx, |view, view_cx| {
-            view.set_marked_text(new_text.to_string(), new_marked_range, view_cx);
+            view.set_marked_text(new_text.to_string(), view_cx);
         });
     }
 
@@ -1840,6 +1848,42 @@ mod tests {
             good_contrast, black_fg,
             "Good contrast should not be adjusted"
         );
+    }
+
+    #[test]
+    fn test_true_color_red_blue_not_washed_out_on_dark_bg() {
+        // Red and blue have inherently low perceptual luminance in APCA.
+        // Pure #ff0000 only achieves Lc ~35 against #1e1e1e — below the
+        // default Lc 45 threshold. ensure_minimum_contrast would lighten
+        // them, washing out the color. This is why cell_style skips the
+        // adjustment for Color::Spec (24-bit true color).
+        let dark_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.05,
+            a: 1.0,
+        };
+
+        for (name, r, g, b) in [
+            ("red", 225, 80, 80),
+            ("blue", 80, 80, 225),
+            ("pure red", 255, 0, 0),
+        ] {
+            let color = terminal::rgba_color(r, g, b);
+            let contrast = apca_contrast(color, dark_bg).abs();
+            assert!(
+                contrast < 45.0,
+                "{name} should have APCA < 45 on dark bg, got {contrast}",
+            );
+
+            let adjusted = ensure_minimum_contrast(color, dark_bg, 45.0);
+            assert!(
+                adjusted.l > color.l,
+                "{name} would be lightened by contrast adjustment (l: {} -> {})",
+                color.l,
+                adjusted.l,
+            );
+        }
     }
 
     #[test]
