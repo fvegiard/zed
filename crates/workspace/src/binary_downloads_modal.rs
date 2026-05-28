@@ -5,11 +5,12 @@
 //! The look and layout mirrors [`crate::security_modal::SecurityModal`], so the
 //! two restrictions feel like a coherent set.
 
+use fs::Fs;
 use gpui::{DismissEvent, EventEmitter, FocusHandle, Focusable};
 use project::{Project, project_settings::ProjectSettings};
-use settings::{Settings, SettingsLocation};
+use settings::{Settings, SettingsLocation, update_settings_file};
 use theme::ActiveTheme;
-use ui::{AlertModal, KeyBinding, ListBulletItem, prelude::*};
+use ui::{AlertModal, ButtonStyle, KeyBinding, ListBulletItem, prelude::*};
 use util::rel_path::RelPath;
 
 use crate::{DismissDecision, ModalView, ToggleBinaryDownloadsRestriction};
@@ -23,14 +24,6 @@ pub enum DisabledScope {
 }
 
 impl DisabledScope {
-    fn settings_location_label(self) -> &'static str {
-        match self {
-            DisabledScope::Global => "your user settings",
-            DisabledScope::Project => "the project's `.zed/settings.json`",
-            DisabledScope::Both => "your user settings (and the project also keeps the same value)",
-        }
-    }
-
     fn override_hint(self) -> &'static str {
         match self {
             DisabledScope::Global => {
@@ -43,6 +36,13 @@ impl DisabledScope {
                 "To allow downloads only for this project while keeping the global default disabled, set \"allow_binary_downloads\": true in .zed/settings.json."
             }
         }
+    }
+
+    /// Whether the global `allow_binary_downloads` setting is the one
+    /// currently disabling downloads. When `true`, the modal can offer an
+    /// "Enable Downloads" shortcut that flips the global value back on.
+    fn global_disabled(self) -> bool {
+        matches!(self, DisabledScope::Global | DisabledScope::Both)
     }
 }
 
@@ -80,18 +80,31 @@ impl BinaryDownloadsModal {
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
     }
+
+    fn enable_and_dismiss(&mut self, cx: &mut Context<Self>) {
+        update_settings_file(<dyn Fs>::global(cx), cx, |settings, _| {
+            settings.project.allow_binary_downloads = Some(true);
+        });
+        self.dismiss(cx);
+    }
 }
 
 impl Render for BinaryDownloadsModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let location_label = self.scope.settings_location_label();
         let override_hint = self.scope.override_hint();
+        let can_enable_globally = self.scope.global_disabled();
 
         AlertModal::new("binary-downloads-modal")
             .width(rems(40.))
             .key_context("BinaryDownloadsModal")
             .track_focus(&self.focus_handle(cx))
-            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.dismiss(cx)))
+            .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| {
+                if can_enable_globally {
+                    this.enable_and_dismiss(cx);
+                } else {
+                    this.dismiss(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.dismiss(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleBinaryDownloadsRestriction, _, cx| this.dismiss(cx)),
@@ -112,10 +125,8 @@ impl Render for BinaryDownloadsModal {
                     )
                     .child(
                         div().pl(IconSize::default().rems() + rems(0.5)).child(
-                            Label::new(format!(
-                                "`allow_binary_downloads` is set to false in {location_label}."
-                            ))
-                            .color(Color::Muted),
+                            Label::new("`allow_binary_downloads` is disabled in the settings.")
+                                .color(Color::Muted),
                         ),
                     ),
             )
@@ -141,26 +152,41 @@ impl Render for BinaryDownloadsModal {
                                 "Files fetched via `download_file` from extensions",
                             )),
                     )
-                    .child(
-                        Label::new("Anything already installed locally still runs.")
-                            .color(Color::Muted),
-                    )
+                    .child(Label::new("Already installed tools will be run.").color(Color::Muted))
                     .child(Label::new(override_hint).color(Color::Muted)),
             )
             .footer(
-                h_flex().px_3().pb_3().gap_1().justify_end().child(
-                    Button::new("ok", "OK")
-                        .style(ButtonStyle::Filled)
-                        .layer(ui::ElevationIndex::ModalSurface)
-                        .key_binding(
-                            KeyBinding::for_action(&menu::Confirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                h_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_1()
+                    .justify_end()
+                    .child(
+                        Button::new("ok", "OK")
+                            .key_binding(
+                                KeyBinding::for_action(&menu::Cancel, cx)
+                                    .map(|kb| kb.size(rems_from_px(12.))),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dismiss(cx);
+                                cx.stop_propagation();
+                            })),
+                    )
+                    .when(can_enable_globally, |this| {
+                        this.child(
+                            Button::new("enable-downloads", "Enable Downloads")
+                                .style(ButtonStyle::Filled)
+                                .layer(ui::ElevationIndex::ModalSurface)
+                                .key_binding(
+                                    KeyBinding::for_action(&menu::Confirm, cx)
+                                        .map(|kb| kb.size(rems_from_px(12.))),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.enable_and_dismiss(cx);
+                                    cx.stop_propagation();
+                                })),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.dismiss(cx);
-                            cx.stop_propagation();
-                        })),
-                ),
+                    }),
             )
             .into_any_element()
     }
